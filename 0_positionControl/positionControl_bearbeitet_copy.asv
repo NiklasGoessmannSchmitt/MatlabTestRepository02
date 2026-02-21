@@ -1,0 +1,627 @@
+%% Fürm mich rellevant: (l.70 control; Fragen Zeilen: 105, 150, 157, 161, 174, 175, 241)
+close all
+clear all
+clc
+
+%%
+curdir=pwd;
+folderstrct = strfind(curdir,'\');
+newdir = curdir(1:folderstrct(end)-1);
+addpath(genpath(newdir))
+
+%% Simulation Settings
+plotEnvelope = false; %Schatten on/off (true/false)
+enablePlots = true;   %unterdrückt plot strecke (true,false)
+samplingTime = 2e-3;  % in [s]       %schneller: 2e-3, 4e-3 (3e-3 fehlermeldung)        %standard: 1e-3     
+plotModulo = 200;     %50 standard
+
+%% AGV setup
+% Fahrzeugkinematik
+shiftControlRoot = 0; 
+additionalDriveLatency = 1;%100;
+
+[pivotParam, agvType, motor, n, agvMeasures, pivotValues, sensor, name, control, velocity] = AGVconfig('Schuhschachtel_YA', samplingTime);      
+% [NGS] - use: 
+% Schuhschachtel_YA - for differential
+% EWS_WFT - for tricycle
+% Baer - for NPivot (2)
+
+% help AGVconfig - to see what AGV models are available
+
+maxSimTime = 250; % in [s]
+simSteps = maxSimTime / samplingTime; 
+
+%% Generate Path 
+order = cellstr('sCurve');
+
+kurveRadius = 1;
+[xq, yq, dq, endIDindx, xAGV, yAGV, aAGV, b, bwd] = getTrack(cell2mat(order),kurveRadius); 
+    
+%% Initialize some values
+% g -- general
+% a -- agv
+g = initGeneralValues(xAGV, yAGV, aAGV, simSteps);
+a = initAgvValues(g, n, agvType, motor, agvMeasures, sensor, pivotParam, pivotValues);    
+agvCenter = zeros(simSteps,2); 
+hh.nop = 0; 
+alternateMapPosOld = zeros(3,1);
+j = 0; 
+
+positioning = false; 
+positioningIndex = 0; 
+targetReached = false; 
+errorBit = false; 
+errorIndex = 0;
+rotationOnly = false; 
+stopReq = false; 
+
+target = zeros(3,1); 
+
+%% RUN simulation 
+for i = 1:g.simSteps
+  
+if strcmp(sensor.type, 'Y')      
+        %% Y Sensor - default calculation
+        [trackDeviation, sensorFrame, xi, yi] = trackSensor(xq, yq, g.curMapPos, a.sensor);
+        if ~isnumeric(trackDeviation.y) 
+            break;
+        end
+        g.trackDeviationBuffer(2,i) = trackDeviation.y; 
+        %% Track Control        %Noch: Nachschauen, was genau control.y.pTrack macht
+        if true || g.curMapPos(1) < (0-a.sensor.pos(1))
+            propPart(i) = (0-trackDeviation.y)*control.y.pTrack;        %Frage: k_p ist variabel?! -A: Nein, das ist GANZER p_Part, also mit k_p*e 
+            intePart(i) = (0-trackDeviation.y)*control.y.iTrack + a.intePartoldY;
+            if i > 1        %k_d nicht berechenbar im ersten Schritt/Durchlauf
+                diffPart(i) = (g.trackDeviationBuffer(2,i-1) - trackDeviation.y)*control.y.dTrack;
+            else
+                diffPart(i) = 0; 
+            end
+            velocityA(i) = propPart(i) + intePart(i) + diffPart(i);     %Frage: Die Geschwindigkeit ist hier Eingang zum system?             %Notation: v_A ... Latex
+            a.intePartoldY = intePart(i);   %Wird gespeichert, da oben in i-Anteil wieder aufgerufen wird!
+        else    %erstmal egal ist immer true
+            pXs = g.curMapPos(1) + velocity.trackSpeed * samplingTime * cos(g.curMapPos(3));
+            pYs = g.curMapPos(2) + velocity.trackSpeed * samplingTime * sin(g.curMapPos(3));   
+            [~, angleOverall, e] = findNearestPointNewton(pXs, pYs, g.curMapPos(1), g.curMapPos(2), g.curMapPos(3), [0 kurveRadius kurveRadius], [0 0 kurveRadius], 1e-3);
+            velocityA(i) = (angleOverall - g.curMapPos(3)) / samplingTime;
+            test = velocityA(i); 
+            velocityA(i) = 0;
+        end
+        vSet = [velocity.trackSpeedTarget; 0; velocityA(i)];
+    
+elseif strcmp(sensor.type, 'YA')    %das wichtiger als vorher, da YA für Diff_Antrieb betrachtet 
+    %% Sensor 
+    [trackDeviation, sensorFrame, xi, yi] = trackSensor(xq, yq, g.curMapPos, a.sensor);
+    if ~isnumeric(trackDeviation.y) 
+        disp('No valid track values!')
+        break;
+    end
+    g.trackDeviationBuffer(2,i) = trackDeviation.y;
+    g.trackDeviationBuffer(3,i) = trackDeviation.a;
+    
+    %% Track Control
+                                    %Ähnlich zu oben. Frage: Wo Unterschied?
+    if strcmp(agvType, 'Diff') || strcmp(agvType, 'Tricycle')
+        
+        % propPartY(i) = (0-trackDeviation.y)*control.y.pTrack;       %Frage: control.y.pTrack == k_p ? Wenn ja wie wird berechnet ... selbst nachschauen.
+        % intePartY(i) = (0-trackDeviation.y)*control.y.iTrack + a.intePartoldY;
+        % if i > 1
+        %     diffPartY(i) = (g.trackDeviationBuffer(2,i-1) - trackDeviation.y)*control.y.dTrack;
+        % else
+        %     diffPartY(i) = 0; 
+        % end
+        % 
+        % propPartA(i) = (0-trackDeviation.a)*control.a.pTrack;       %Hier Unterschied: Nun auch A
+        % intePartA(i) = (0-trackDeviation.a)*control.a.iTrack + a.intePartoldA;
+        % if i > 1
+        %     diffPartA(i) = (g.trackDeviationBuffer(3,i-1) - trackDeviation.a)*control.a.dTrack;
+        % else
+        %     diffPartA(i) = 0; 
+        % end
+        % 
+        % velocityA(i) = propPartY(i) + intePartY(i) + diffPartY(i)...    %Hier Unterschied!! Alles zu einer vA aufsummiert? Wo unterscheidung Räder?
+        %              + propPartA(i) + intePartA(i) + diffPartA(i);
+        % a.intePartoldY = intePartY(i);      %Übernimmt wieder nur i-Part
+        % a.intePartoldA = intePartA(i);
+        % 
+        % vSet = [velocity.trackSpeed; 0; velocityA(i)];
+        % %verwendet wird standardmäßig k_p= ??
+
+        %vonNiklas13.11.2025        %TODO: stimmten die übernommenen Werte? & gibt es konflikt mit meinen bezeichnern?
+        theta_e = trackDeviation.a;     %Winkel alpha [°]
+        d_distance = trackDeviation.y;  %Abstand Spur [m]
+        u_1 = velocity.trackSpeed;        %Vorwärtsgeschw. [m/s]
+        l_1 = 1;                         %Sensor-Versatz in [m]         %TODO: wo bekommen ich den her?
+        k_0 = 20;                        %>0 frei wählbar [ohne Einheit]   %100 gut; offenbar zu hoch 150
+
+        k_d_theta = k_0 * cos(theta_e);   %[ohne Einheit]
+        k_d_theta2 = k_0 * cos(theta_e) * cos(theta_e);
+        k_d_theta3 = k_0 * cos(theta_e) * exp(-abs(d_distance));        %das hat nur leicht geholfen, das macht für große d den einfluss von 2tem summand fast 0 und nur noch winkel ist rellevant! --> brauche gleichgewicht zwischen Winkel theta (gewichtung) und d (Gewichtung)
+        %Ziel: Regler so gut auslegen [d.h. anteile die sich um theta und d kümmer so gut miteinander arbeiten lassen], dass ingesamte Verstärkung so hoch wie nur möglich schrauben kann!!!
+        %Ansatz: Gegenseitige Beeinflussung von theta und d in u2!! (für alle kombinationen (theta,d) schaffe optimales verhältnis)
+        %   Dazu: Betrachte Gesamtdynamik \dot d Gleichung (13) Latex. Passe das an. Schaue wie u2 demnach aussehen muss!
+        %Ansatz2: Sättigung einbauen. |dot u2| < k
+
+        %Regler
+        velocityA(i) = (-u_1*tan(theta_e)/l_1) - (u_1/cos(theta_e))*k_d_theta*d_distance;
+        vSet = [velocity.trackSpeed; 0; velocityA(i)];
+
+        %Parametereinstellung:      %!alternatives k_d_theta macht Verhalten ingesamt vielleicht besser!
+        %k_0 gewichtet Abstand d
+        %   =1 ... aus kurve raus
+        %   =10 ... ok aber schelchter als PID ?
+        %   =50 ... fast absolut perfekt    %vergleichbar PID kp=10        %PID mit kp=50 macht mist!! auch erhöhung .a=20 macht nicht besser
+        %alternatives k_d_theata: Ziel: gewichtung für winkel theta einbauen... bisher 2ter term nur von d abh
+        %-> verschiebt nur das Problem! Parameterwahl k_0=200
+        %veranschaulicht gut an Kurve das Problem: Hohe abweichungen Y
+        %führen zu aggressiven regler verhalten - Wünschenswert funnel
+        %control, d.h. plötzlich hohe Werte sollen gar nicht vorkommen!
+        %Oder: Erlaube nicht so stark gegenlenken. Bzw beschränke \dot u2
+        %... aber stelle dennoch konvergenz sicher für gegeben c_max
+        %   Ansatz: Sättigung dot u2? Implizit realisieren, durch
+        %   auslegung k_d_theta möglich? ... *1/d [eliminiert d term] ... *
+        %   hm will nicht linear verändern, sondern in abhängigkeit vom abs
+        %   wert ... d.h. für große Werte weniger aggressiv und für kleine
+        %   Werte sehr aggressiv --> Umsetzen: Method1 Zonen (if) einführen
+        %   Methode2: funktion f(d), f kann beliebig sein muss aber die
+        %   eigenschaften erfüllen. Nehme arctan? oder besser vgl f von
+        %   Tobias. Oder exp(-|d|)
+    else       
+        orientationOnTrack = 0; % in [deg]
+
+        tempVXStar = velocity.trackSpeed * cos(orientationOnTrack);
+        tempVYStar = velocity.trackSpeed * sin(orientationOnTrack);
+
+        tempVXSnake = - trackDeviation.y * cos(pi/2 - trackDeviation.a) * control.y.pTrack;
+        tempVYSnake = - trackDeviation.y * sin(pi/2 - trackDeviation.a) * control.y.pTrack;
+        tempVASnake = - (orientationOnTrack + trackDeviation.a) *  control.a.pTrack;
+
+        vSet(1) = tempVXStar + tempVXSnake; 
+        vSet(2) = tempVYStar + tempVYSnake; 
+        vSet(3) = 	           tempVASnake; 
+    
+% % %     %% rot
+% % %     tempvSet(1) = cos(trackDeviation.a) * vSet(1) + sin(trackDeviation.a) * vSet(2); 
+% % %     tempvSet(2) = cos(trackDeviation.a) * vSet(2) - sin(trackDeviation.a) * vSet(1); 
+% % %     
+% % %     vSet = [tempvSet(1); tempvSet(2); vSet(3)]; 
+    end 
+end
+
+%% Velocity Ramping     %Frage: was macht dieser Abschnitt & ist wichtig für mich?
+[vRamped, ~, ~, accBit, decBit] = LSimoveC_UC_MoveCtrl_Ramp ...
+    (stopReq, (~a.statSteering || a.statMovement), 1, vSet, velocity.vMax, velocity.acc, velocity.dec, samplingTime);
+
+g.vRampedBuffer(:,i) = vRamped; 
+g.vSetBuffer(:,i) = vSet;
+
+%% Kinematics       %Frage: was macht dieser Abschnitt & ist wichtig für mich? -A: ja ist wohl wichtig.
+if strcmp(agvType, 'Diff')
+    [vl, vr] = invKinDiffDrive(vRamped,a.pivotParam);       %Warum wird hier vl, vr berechnet, wo das doch in den nächsten 2 Zeilen direkt überschrieben wird? -A: Ist input in den Zeilen unten.
+    
+    [vl, a.zl] = myFilter(motor(1,:),motor(2,:),vl,a.zl); % transfer function       %tf des verwendeten Filter, richtig? (bzw die dafür nötigen Werte vl,a.zl)? Die müssten dann noch eingelesen werden um tatsächlich tf zu erhalten?!
+    [vr, a.zr] = myFilter(motor(1,:),motor(2,:),vr,a.zr); % transfer function   
+    a.vlBuffer(i) = vl;
+    a.vrBuffer(i) = vr; 
+       
+    if i <= additionalDriveLatency 
+        vl = 0; 
+        vr = 0; 
+    else
+        vl = a.vlBuffer(i-additionalDriveLatency);
+        vr = a.vrBuffer(i-additionalDriveLatency);
+    end
+
+    vCurrent = fwdKinDiffDrive(vl,vr,a.pivotParam);         %das scheint wichtig zu sein! Ist es das?
+    g.vCurrent(:,i) = vCurrent;                             %das scheint wichtig zu sein! Ist es das?
+    
+elseif strcmp(agvType, 'Tricycle')   
+    forbiddenangles(1).lower = 2.2;
+    forbiddenangles(1).higher = 3.2;
+    forbiddenangles(2).lower = -3.2;
+    forbiddenangles(2).higher = -2.2;
+         
+    standstill = true; 
+    if i > 1 
+        standstill = abs(a.vsCurrentBuffer(i-1)) < 0.1 && abs(a.steeringVelocityBuffer(i)) < 0.01;
+    end 
+
+    angularTolerance = 0.03; % in [rad]
+    [vs, a.betaSetpoints, steering, movement, stopReq] = LSimoveC_UC_Kin_Tricycle_V2W(vRamped, a.pivotParam, a.oldBeta, angularTolerance, forbiddenangles, rotationOnly, standstill); 
+
+    vsmin = 0.01;
+    if abs(vs) < vsmin && vs ~= 0.0
+        vmin = LSimoveC_UC_MoveCtrl_Tricycle_W2V(vsmin, beta, a.pivotParam);
+        [vs, a.betaSetpoints, steering, movement] = LSimoveC_UC_Kin_Tricycle_V2W(vmin, a.pivotParam, a.oldBeta, angularTolerance, forbiddenangles, rotationOnly, standstill); 
+    end
+    
+    % SETPOINT
+    releaseSteering = 1;
+    steerShortestWay = false;
+    setpointSteeringVelocity = LSimoveC_UC_Kin_SteeringControl...
+        (releaseSteering, a.betaSetpoints, a.oldBeta, steerShortestWay, ...
+        control.pivot.omegaMaxRadS, ...
+        control.pivot.maxAccelerationWheel, ...
+        control.pivot.kp, samplingTime);
+
+%     [steeringVelocity, a.z] = myFilter(motor(1,:),motor(2,:),setpointSteeringVelocity,a.z); % transfer function
+    steeringVelocity = setpointSteeringVelocity; % tf = 1
+    beta = a.oldBeta + steeringVelocity * samplingTime;
+    a.pivotValues.angularPosition = beta;
+    
+    vCurrent = LSimoveC_UC_MoveCtrl_Tricycle_W2V(vs, beta, a.pivotParam); 
+    
+    g.vCurrent = vCurrent';
+    a.statSteering = steering; 
+    a.statMovement = movement;
+    a.oldBeta = beta;
+    
+    a.vsCurrentBuffer(i) = vs; 
+    a.betaCurrentBuffer(i) = beta; 
+    a.betaSetpointBuffer(i) = a.betaSetpoints;
+    a.steeringVelocitySetpointBuffer(i) = setpointSteeringVelocity;
+    a.steeringVelocityBuffer(i) = steeringVelocity; 
+    a.steeringBuffer(i) = steering;
+    a.movementBuffer(i) = movement; 
+    
+elseif strcmp(agvType, 'PivotActive')
+    
+%         rampingFactorSteering = 1; 
+    omegaMax = 1000;
+    iTolerance = 4e-3;
+    iStandstill = true; 
+    tempParam = a.pivotParam;
+    tempParam(1).position.x = a.pivotParam(1).position.x + shiftControlRoot; 
+    tempParam(2).position.x = a.pivotParam(2).position.x + shiftControlRoot;
+
+    [vs, a.betaSetpoints] = LSimoveC_UC_MoveCtrl_NPivot_V2W(vRamped, a.pivotValues, tempParam, n, omegaMax, a.rampingFactorSteering, iTolerance, 0.5, iStandstill, 0);
+    a.betaSetpointBuffer(:,i) = a.betaSetpoints; 
+    
+    Release = true; 
+    iKp = 1; 
+    iOmegaMaxRadS = 5; % [rad/s]            %das und die zeile darunter schein wichtig zu sein?
+    wheelAcceleration = 60; % [rad/s²]
+
+    [setpointSteeringVelocity, a.rampingFactorSteering] = LSimoveC_UC_MoveCtrl_NP_SteeringControl(n, a.betaSetpoints, Release, iKp, a.pivotValues, iOmegaMaxRadS, wheelAcceleration, samplingTime);
+    
+    for p = 1:n
+        [steeringVelocity(p), a.z(p,:)] = myFilter(motor(1,:),motor(2,:),setpointSteeringVelocity(p),a.z(p,:));
+        a.pivotValues(p).angularPosition = a.pivotValues(p).angularPosition + steeringVelocity(p) * samplingTime;
+        
+        % myFiler -- tf(1)
+        a.pivotValues(p).velocity = vs(p);
+        
+        % buffers
+        a.betaCurrentBuffer(p,i) = a.pivotValues(p).angularPosition;
+        a.steeringVelocityBuffer(p,i) = steeringVelocity(p);
+        a.vsSetpointBuffer(p,i) = vs(p);
+    end
+    
+    epsilon = 0.15;
+    [v, omegaMaxError] = LSimoveC_UC_MoveCtrl_NPivot_W2V(n, a.pivotValues, epsilon, a.pivotParam);
+    vCurrent = v; 
+    g.vCurrent(:,i) = vCurrent; 
+    omegaMaxErrorBuffer(i) = omegaMaxError; 
+    
+    
+elseif strcmp(agvType, 'PivotPassive')
+    
+    rampingFactorSteering = 1; 
+    omegaMax = 1000;
+    iTolerance = 4e-3;
+    iStandstill = false; 
+    
+    [vs, a.betaSetpoints] = LSimoveC_UC_MoveCtrl_NPivot_V2W(vRamped, a.pivotValues, a.pivotParam, n, omegaMax, rampingFactorSteering, iTolerance, 0.5, iStandstill, 0);
+    a.betaSetpointBuffer(:,i) = a.betaSetpoints; 
+    
+    minvs = 10e-3; 
+    if min(abs(vs)) >= minvs 
+        % nothing
+    elseif min(abs(vs)) > 0.0  
+        vs = vs*minvs/min(abs(vs));  
+    else 
+        vs = zeros(1,a.n); 
+    end 
+    
+    a.vsCurrentBuffer(:,i) = vs; 
+
+    Release = true; 
+    iKp = 1; 
+    iOmegaMaxRadS = 1.4; % [rad/s]
+    wheelAcceleration = 9; % [rad/s²]
+    [setpointSteeringVelocity, rampingFactorSteering] = LSimoveC_UC_MoveCtrl_NP_SteeringControl(n, a.betaSetpoints, Release, iKp, a.pivotValues, iOmegaMaxRadS, wheelAcceleration, samplingTime);
+    
+    for p = 1:n           
+        [vl(p), vr(p)] = invKinDiffDrive([vs(p),0,setpointSteeringVelocity(p)],a.pivotParam(p));
+    end
+
+    for p = 1:n 
+        vCurrent = fwdKinDiffDrive(vl(p),vr(p),a.pivotParam(p)); 
+        steeringVelocity(p) = vCurrent(3); 
+        vs(p) = vCurrent(1); 
+        
+%         [steeringVelocity(p), a.z(p,:)] = myFilter(motor(1,:),motor(2,:),setpointSteeringVelocity(p),a.z(p,:));
+        a.pivotValues(p).angularPosition = a.pivotValues(p).angularPosition + steeringVelocity(p) * samplingTime;
+        if isnan(a.pivotValues(p).angularPosition) 
+            disp('error!!')
+        end
+        a.pivotValues(p).velocity = vs(p);
+        
+        % buffers
+        a.oldBeta(p) = a.pivotValues(p).angularPosition; 
+        a.betaCurrentBuffer(p,i) = a.oldBeta(p);
+        a.SteeringVelocityBuffer(p:i) = steeringVelocity(p);
+%         a.vlBuffer(p,i) = vl(p);
+%         a.vrBuffer(p,i) = vr(p); 
+    end
+    a.vlBuffer(:,i) = vl;
+    a.vrBuffer(:,i) = vr; 
+    
+    epsilon = 0.15;
+    vCurrent = LSimoveC_UC_MoveCtrl_NPivot_W2V(n, a.pivotValues, epsilon, a.pivotParam);
+    g.vCurrent(:,i) = vCurrent; 
+%     vCurrent = v; 
+    
+else
+    disp('No W2V for such AGV type!')
+end
+
+%% Update AGV position          %ok klar was das macht.
+g.curMapPos(3) = g.oldMapPos(3) + vCurrent(3) * samplingTime;
+% if curMapPos(3) < 0 
+%     curMapPos(3) = curMapPos(3) + 2*pi; 
+% end
+% if curMapPos(3) > 2*pi
+%     curMapPos(3) = curMapPos(3) - 2*pi;
+% end
+
+g.curMapPos(1) = g.oldMapPos(1) ...
+                       + (vCurrent(1) * samplingTime) * cos(g.curMapPos(3) ) ...
+                       - (vCurrent(2) * samplingTime) * sin(g.curMapPos(3) ); 
+g.curMapPos(2) = g.oldMapPos(2) ...
+                       + (vCurrent(1) * samplingTime) * sin(g.curMapPos(3) ) ...
+                       + (vCurrent(2) * samplingTime) * cos(g.curMapPos(3) ); 
+                   
+g.oldMapPos = g.curMapPos;
+
+% toc
+
+%% PLOT everything
+if mod(i,plotModulo) == 0 && enablePlots
+    
+    if j == 0 
+        fGlobalMap = figure('units','normalized','outerposition',[0 0 1 1]);
+    end
+    j = j + 1;
+    
+    pause(0.001)
+    
+    figure(fGlobalMap);
+    
+    if exist('I','var') % does an image file exist?
+        if ~isfield(hh, 'image') % has an image been printed?
+            hh.image = image([0 30],[0 26], I); hold on;
+            uistack(hh.image,'bottom')
+        end    
+    end
+
+    daspect([1 1 1])    
+    hh.track = plot(xq,yq,'b','LineWidth',2); grid on; hold on 
+
+    if exist('agvhandles','var')
+        if ~plotEnvelope 
+            if isfield(agvhandles,'agvBody');delete(agvhandles.agvBody);end
+        end
+        if isfield(agvhandles,'agvCenter');delete(agvhandles.agvCenter);end
+        if isfield(agvhandles,'agvCoSystem');delete(agvhandles.agvCoSystem);end
+        if isfield(agvhandles,'pivotCenter');delete(agvhandles.pivotCenter);end
+        if isfield(agvhandles,'pivotWheel');delete(agvhandles.pivotWheel);end
+    end
+    agvhandles = plotAGV(a,g,gca);
+
+%%
+    % AGV position trace                               
+    agvCenter(j,:) = [g.curMapPos(1) g.curMapPos(2)]; 
+    plot(agvCenter(1:j,1),agvCenter(1:j,2), 'g')      
+    plot(xq(endIDindx),yq(endIDindx),'go')
+        
+    % sensor
+    if strcmp(sensor.type, 'Y') || strcmp(sensor.type, 'YA')
+        if isfield(hh,'YASensor');delete(hh.YASensor);end
+        if isfield(hh,'YAIntersection');delete(hh.YAIntersection);end
+        hh.YASensor = plot(sensorFrame(2:3,1), sensorFrame(2:3,2),'k-','LineWidth',1.5); % AGV sensor
+        hh.YAIntersection = plot(xi, yi,'ro'); % plot intersection
+    end
+
+    title('Global Map')
+    ylim=get(gca,'ylim');
+    xlim=get(gca,'xlim');
+
+    if strcmp(sensor.type, 'Y')
+        content = sprintf([  'TrackSpeed: ', num2str( sqrt(vCurrent(1)^2 + vCurrent(2)^2) ), ' m/s' ...
+                           '\nP_Y: '       , num2str( control.y.pTrack )... 
+                           '\nI_Y: '       , num2str( control.y.iTrack )... 
+                           '\nD_Y: '       , num2str( control.y.dTrack )... 
+                           '\nvA_{max}: '  , num2str( max(abs(g.vCurrent(3,:))) ), ' rad/s' ...
+                           '\nyDev_{max}: ', num2str( max(abs(g.trackDeviationBuffer(2,:)))*1e3 ), ' mm' ... 
+                           '\npos.x: '     , num2str( sensor.pos(1)*1e3 ), ' mm' ...
+                             ]);
+    elseif strcmp(sensor.type, 'YA')
+        content = sprintf([  'TrackSpeed: ', num2str( sqrt(vCurrent(1)^2 + vCurrent(2)^2) ), ' m/s' ...
+                           '\nP_Y: '       , num2str( control.y.pTrack ), '   P_A: ', num2str( control.a.pTrack )... 
+                           '\nI_Y: '       , num2str( control.y.iTrack ), '     I_A: ', num2str( control.a.iTrack )... 
+                           '\nD_Y: '       , num2str( control.y.dTrack ), '   D_A: ', num2str( control.a.dTrack )...  
+                           '\nvA_{max}: '  , num2str( max(abs(g.vCurrent(3,:))) ), ' rad/s' ...
+                           '\nyDev_{max}: ', num2str( max(abs(g.trackDeviationBuffer(2,:)))*1e3 ), ' mm' ... 
+                           '\npos.x: '     , num2str( sensor.pos(1)*1e3 ), ' mm' ...
+                             ]);
+                         
+    else
+        content = 'sensortype unknown';
+    end
+    
+    if strcmp(agvType, 'Tricycle')
+        
+        ey = sqrt( (target(2)*cos(target(3)-pi/2)/sin(target(3)-pi/2))^2 + target(2)^2 ); % ytolerance in [m]
+        content = sprintf([  'Track Speed: ', num2str( sqrt(vCurrent(1)^2 + vCurrent(2)^2) ), ' m/s',               ...
+                           '\nWheel Omega_{max}: ', num2str(control.pivot.omegaMaxRadS), ' rad/s',                  ...
+                           '\nWheel Acceleration_{max}: ', num2str(control.pivot.maxAccelerationWheel), ' rad/s^2', ...
+                           '\nK_p Steering: ', num2str(control.pivot.kp),                                           ...
+                           '\ne_y: ', num2str(ey),                                                                  ...
+                           '\nTrackSpeed: ', num2str( sqrt(vCurrent(1)^2 + vCurrent(2)^2) ), ' m/s' 
+                           ]);
+        
+    elseif strcmp(agvType, 'Mecanum') || strcmp(agvType, 'Diff') || strcmp(agvType, 'PivotPassive') || strcmp(agvType, 'PivotActive')            
+        % nothing  
+    else 
+        figure(fGlobalMap); clf
+        j = 1; % to avoid endless windows popping up
+    end
+end
+
+end
+%% Plot Track Deviations
+if strcmp(sensor.type, 'Y')
+    
+    figure('units','normalized','outerposition',[0 0 1 1])
+    subplot(211)
+    plot(1:i, g.trackDeviationBuffer(2,1:i)); grid on 
+    title('Track Deviation in [m]')
+    axis([0 i min(g.trackDeviationBuffer(2,1:i))-0.01 max(g.trackDeviationBuffer(2,1:i))+0.01])   
+    subplot(212)
+    title('PID')
+    plot(1:i-1, propPart(1:i-1)); grid on; hold on 
+    plot(1:i-1, intePart(1:i-1)) 
+    plot(1:i-1, diffPart(1:i-1))
+    plot(1:i-1, propPart(1:i-1)+intePart(1:i-1)+diffPart(1:i-1),'LineWidth',2.0)
+    axis([0 i min(propPart(1:i-1)+intePart(1:i-1)+diffPart(1:i-1))-0.01 max(propPart(1:i-1)+intePart(1:i-1)+diffPart(1:i-1))+0.01])
+    
+elseif strcmp(sensor.type, 'YA')
+    
+    figure('units','normalized','outerposition',[0 0 1 1])
+    subplot(211)
+    plot(1:i, g.trackDeviationBuffer(2,1:i)); grid on 
+    title('Track Deviation in [m]')
+    axis([0 i min(g.trackDeviationBuffer(2,1:i))-0.01 max(g.trackDeviationBuffer(2,1:i))+0.01])   
+    subplot(212)
+    plot(1:i, g.trackDeviationBuffer(3,1:i)); grid on 
+    title('Track Deviation in [rad]')
+    axis([0 i min(g.trackDeviationBuffer(3,1:i))-0.01 max(g.trackDeviationBuffer(3,1:i))+0.01])   
+end 
+
+%% XYA Velocities
+plotXYAVelocities(g,i)
+
+%% Process Values
+if strcmp(agvType, 'Diff')
+    figure('units','normalized','outerposition',[0 0 1 1])
+    subplot(311)
+    plot(1:i, a.vlBuffer(1:i)); hold on; grid on
+    title('v_L')
+
+    subplot(312)
+    plot(1:i, a.vrBuffer(1:i)); hold on; grid on
+    title('v_R')
+    
+elseif strcmp(agvType, 'Tricycle') 
+    figure('units','normalized','outerposition',[0 0 1 1])
+    subplot(311)
+    plot(1:i, a.vsCurrentBuffer(1:i)); hold on; grid on
+    ylim = get(gca,'ylim');
+    if errorIndex > 0; plot([errorIndex errorIndex],[ylim(1) ylim(2)],'k-.','LineWidth',1); end
+    if strcmp(sensor.type, 'ANS')
+        h = fill([positioningIndex,i,i,positioningIndex],...
+                 [ylim(1),ylim(1),ylim(2),ylim(2)],'green');
+        set(h,'Linestyle','none','facealpha',.3)
+    end
+    title('vs')
+    if ~strcmp(sensor.type, 'ANS'); legend('vs');
+    elseif errorIndex > 0; legend('vs','Error','Positioning');
+    else; legend('vs','Positioning'); 
+    end
+
+    subplot(312)
+    plot(1:i, a.betaCurrentBuffer(1:i)*180/pi); grid on; hold on 
+    plot(1:i, a.betaSetpointBuffer(1:i)*180/pi)
+    ylim=get(gca,'ylim');
+    if errorIndex > 0; plot([errorIndex errorIndex],[ylim(1) ylim(2)],'k-.','LineWidth',1); end
+    if strcmp(sensor.type, 'ANS')
+        h= fill([positioningIndex,i,i,positioningIndex],...
+                [ylim(1),ylim(1),ylim(2),ylim(2)],'green');
+        set(h,'Linestyle','none','facealpha',.3)
+    end
+    title('beta')
+    if ~strcmp(sensor.type, 'ANS'); legend('beta');
+    elseif errorIndex > 0; legend('beta','betaSetpoint','Error','Positioning');
+    else; legend('beta','betaSetpoint','Positioning'); 
+    end
+
+    subplot(313)
+    plot(1:i, a.steeringVelocityBuffer(1:i)); hold on, grid on 
+    plot(1:i, a.steeringVelocitySetpointBuffer(1:i))
+    ylim=get(gca,'ylim');
+    if errorIndex > 0; plot([errorIndex errorIndex],[ylim(1) ylim(2)],'k-.','LineWidth',1); end
+    if strcmp(sensor.type, 'ANS')
+        h= fill([positioningIndex,i,i,positioningIndex],...
+                [ylim(1),ylim(1),ylim(2),ylim(2)],'green');
+        set(h,'Linestyle','none','facealpha',.3)
+    end
+    title('beta velocity')
+    if ~strcmp(sensor.type, 'ANS'); legend('betaVelocitySetpoint');
+    elseif errorIndex > 0; legend('betaVelocitySetpoint','betaVelocity','Error','Positioning');
+    else; legend('betaVelocitySetpoint','betaVelocity','Positioning'); 
+    end
+    
+elseif strcmp(agvType, 'PivotActive')
+    figure('units','normalized','outerposition',[0 0 1 1])
+    
+    subplot(411)
+    plot(1:i, a.vsSetpointBuffer(1,1:i)); hold on; grid on
+    plot(1:i, a.vsSetpointBuffer(2,1:i))
+    plot(1:i, a.vsSetpointBuffer(3,1:i))
+    legend('front','left','right')
+    title('v_S')
+
+    subplot(412)
+    plot(1:i, a.betaCurrentBuffer(1,1:i),'Color','r','LineWidth',1.5); hold on; grid on
+    plot(1:i, a.betaSetpointBuffer(1,1:i),'Color','r','LineWidth',0.5)
+    plot(1:i, a.betaCurrentBuffer(2,1:i),'Color','b','LineWidth',1.5)
+    plot(1:i, a.betaSetpointBuffer(2,1:i),'Color','b','LineWidth',0.5)
+    plot(1:i, a.betaCurrentBuffer(3,1:i),'Color','g','LineWidth',1.5)
+    plot(1:i, a.betaSetpointBuffer(3,1:i),'Color','g','LineWidth',0.5)
+    legend('current','setpoint','right')
+    title('beta')
+
+    subplot(413)
+    plot(1:i, a.steeringVelocityBuffer(1,1:i)); hold on; grid on
+    plot(1:i, a.steeringVelocityBuffer(2,1:i))
+    plot(1:i, a.steeringVelocityBuffer(3,1:i))
+    legend('front','left','right')
+    title('beta velo')
+
+    subplot(414)
+    plot(1:i-1,omegaMaxErrorBuffer(1:i-1)); grid on
+    title('max omega error')
+
+ elseif strcmp(agvType, 'PivotPassive')
+    figure('units','normalized','outerposition',[0 0 1 1])
+    
+    subplot(411)
+    plot(1:i, a.vsCurrentBuffer(1,1:i)); hold on; grid on
+    plot(1:i, a.vsCurrentBuffer(2,1:i)); grid on 
+    title('v_s')
+    
+    subplot(412)
+    plot(1:i, a.betaCurrentBuffer(1,1:i)); hold on; grid on
+    plot(1:i, a.betaCurrentBuffer(2,1:i)); grid on 
+    title('alpha')
+    
+    subplot(413)
+    plot(1:i, a.vlBuffer(1,1:i)); hold on; grid on
+    plot(1:i, a.vlBuffer(2,1:i)); grid on 
+    title('v_L')
+
+    subplot(414)
+    plot(1:i, a.vrBuffer(1,1:i)); hold on; grid on
+    plot(1:i, a.vrBuffer(2,1:i)); grid on 
+    title('v_R')
+end

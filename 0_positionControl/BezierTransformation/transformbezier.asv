@@ -1,0 +1,167 @@
+function [bezier] = transformbezier(dxf)
+% Summary of this function goes here
+%   Detailed explanation goes here
+
+k=[];
+
+% for i = 1:dxf.ne 
+for i = 1:50
+
+
+switch dxf.entities(i).name
+     case 'POINT'
+        dxf.entities(i).bezier = transform_point(dxf.entities(i).point);
+     case 'LINE'
+        dxf.entities(i).bezier = transform_line(dxf.entities(i).line);
+     case 'LWPOLYLINE'
+        dxf.entities(i).bezier = transform_poly(dxf.entities(i).poly);
+     case 'CIRCLE'
+        dxf.entities(i).bezier = transform_circle(dxf.entities(i).circle);
+     case 'ARC'
+        dxf.entities(i).bezier = transform_arc(dxf.entities(i).arc);
+     case 'ELLIPSE'
+        dxf.entities(i).bezier = transform_ellipse(dxf.entities(i).ellipse);
+     case 'SPLINE'
+        dxf.entities(i).bezier = transform_spline(dxf.entities(i).spline);
+  end
+
+end
+
+%Point
+    function k= transform_point(point)
+        k.point.X1= point(1);
+        k.point.Y1= point(2);
+
+
+    end
+
+%Line
+    function k= transform_line(line)
+        %Line(Xi,Yi,Xj,Yj)
+        Xi=line(1);
+        Yi=line(2);
+        Xj=line(3);
+        Yj=line(4);
+        %Rechnen
+%         k.line.X1=Xi;
+%         k.line.Y1=Yi;
+% 
+%         k.line.X2=Xj;
+%         k.line.Y2=Yj;
+% 
+%         k.line.X3=(k.line.X1+k.line.X2)/2;
+%         k.line.Y3=(k.line.Y1+k.line.Y2)/2;
+
+          Xk= (Xi + Xj)/2;
+          Yk= (Yi +Yj)/2;
+
+
+        k.linie=[Xi Yi, Xj Yj, Xk Yk ];
+
+    end
+
+%LWPOLYLINE
+    function k= transform_poly(poly)
+        %vertices X,Y array [n_verts,2]
+        k.poly.X1=poly(1,1)
+        k.poly.Y2=poly(1,2)
+        k.poly.X2
+
+
+    end
+    
+%CYCLE
+    function k= transform_circle(circle)
+        % plot circles: (X Center,Y Center,Radius)
+        x = circle(1);
+        y = circle(2);
+        r = circle(3);
+
+        k.cycle.X1= x+r;
+        k.cycle.Y1= y;
+        k.cycle.X2= x-r;
+        k.cycle.Y2= y;
+        k.cycle.X3=x;
+        k.cycle.Y3=y-r;
+
+    end
+
+%ARC
+    function k= transform_arc (arc)
+        %ARC (Xc, Yc, R, begin angle, end angle)
+        x = arc(1);
+        y = arc(2);
+        r = arc(3);
+        a1 = arc(4); %Startwinkel
+        a2 = arc(5); %Endwinkel
+
+
+        if a2<a1
+            a2 = a2 + 360;
+        end
+
+        k.arc.X1=x+cos(a1)*r; %Fallunterscheidung nötig?
+        k.arc.Y1=y+sin(a1)*r;
+
+        k.arc.X2=x+cos(a2)*r;
+        k.arc.Y2=y+sin(a1)*r;
+
+        if a1<90 && a2<=90
+            k.arc.X1= x+sin(a1)* r;
+            k.arc.Y1= y+cos(a1)* r;
+            k.arc.X2= x+sin(a2)* r;
+            k.arc.Y2= y+cos(a2)* r;
+
+            k.arc.X3=x+r;
+            k.arc.Y3=y+r;
+
+        elseif a1<180 && a2<=180
+            k.arc.X1=x+cos(a1)*r;
+            k.arc.Y1=y-sin(a1)*r;
+            k.arc.X2=x+cos(a2)*r;
+            k.arc.Y2=y-sin(a2)*r;
+
+            k.arc.X3=x+r;
+            k.arc.Y3=y-r;
+
+        elseif a1<270 && a2<=270
+            k.arc.X1=x-sin(a1)*r;
+            k.arc.Y1=y-cos(a1)*r;
+            k.arc.X2=x-sin(a2)*r;
+            k.arc.Y2=y-cos(a2)*r;
+
+            k.arc.X3=x-r;
+            k.arc.Y3=y-r;
+
+        else
+            k.arc.X3=x-r;
+            k.arc.Y3=y+r;
+
+            k.arc.X1=x+cos(a1)*r; %Fallunterscheidung nötig?
+            k.arc.Y1=y+sin(a1)*r;
+
+            k.arc.X2=x+cos(a2)*r;
+            k.arc.Y2=y+sin(a1)*r;
+
+        end
+    end
+
+    %ELLIPSE
+    function k= transform_ellipse(ellipse)
+    %Ellipse(Xc, Yc, Xe, Ye, ratio, begin angle, end angle)
+            k.ellipse.X1= ellipse(1);
+            k.ellipse.Y2= ellipse(2);
+
+
+
+    end
+
+    %SPLINE
+    function k= transform_spline(spline)
+
+
+
+    end
+
+
+end
